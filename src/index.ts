@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as tools from "./tools";
 import { getVersion } from "./utils";
 
@@ -37,35 +38,39 @@ const createServer = () => {
 const app = express();
 app.use(express.json());
 
-const transports: Record<string, SSEServerTransport> = {};
+// --- Streamable HTTP transport (modern /mcp endpoint) ---
+const streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
 
-app.get("/sse", async (req, res) => {
-	const transport = new SSEServerTransport("/messages", res);
-	const sessionId = transport.sessionId;
-	transports[sessionId] = transport;
+app.all("/mcp", async (req, res) => {
+	const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-	transport.onclose = () => {
-		delete transports[sessionId];
-	};
-
-	const server = createServer();
-	await server.connect(transport);
-});
-
-app.post("/messages", async (req, res) => {
-	const sessionId = req.query.sessionId as string;
-	if (!sessionId) {
-		res.status(400).send("Missing sessionId parameter");
+	if (sessionId && streamableTransports[sessionId]) {
+		const transport = streamableTransports[sessionId];
+		await transport.handleRequest(req, res, req.body);
 		return;
 	}
 
-	const transport = transports[sessionId];
-	if (!transport) {
-		res.status(404).send("Session not found");
+	if (req.method === "POST") {
+		const transport = new StreamableHTTPServerTransport({
+			sessionIdGenerator: () => randomUUID(),
+			onsessioninitialized: (id) => {
+				streamableTransports[id] = transport;
+			},
+		});
+
+		transport.onclose = () => {
+			if (transport.sessionId) {
+				delete streamableTransports[transport.sessionId];
+			}
+		};
+
+		const server = createServer();
+		await server.connect(transport);
+		await transport.handleRequest(req, res, req.body);
 		return;
 	}
 
-	await transport.handlePostMessage(req, res, req.body);
+	res.status(400).send("Bad Request: No valid session ID provided");
 });
 
 app.get("/health", (_req, res) => {
@@ -75,13 +80,13 @@ app.get("/health", (_req, res) => {
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 
 app.listen(PORT, "0.0.0.0", () => {
-	console.log(`Railway MCP SSE server listening on port ${PORT}`);
+	console.log(`Railway MCP server listening on port ${PORT}`);
 });
 
 process.on("SIGINT", async () => {
-	for (const sessionId in transports) {
-		await transports[sessionId].close();
-		delete transports[sessionId];
+	for (const id in streamableTransports) {
+		await streamableTransports[id].close();
+		delete streamableTransports[id];
 	}
 	process.exit(0);
 });
